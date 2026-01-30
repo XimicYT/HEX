@@ -1,0 +1,15 @@
+{
+  "name": "hex-conquest",
+  "version": "1.0.0",
+  "description": "Multiplayer Hexagonal Territory Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}
