@@ -1,111 +1,216 @@
+// server.js
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
-require('dotenv').config();
+const cors = require('cors');
 
 const app = express();
+app.use(cors());
+
 const server = http.createServer(app);
+// Allow connections from anywhere (for your "host anywhere" requirement)
 const io = new Server(server, {
-    cors: { origin: "*" }
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-// Supabase Connection
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// Initialize Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-let mapData = {}; 
-let players = {};
+// Game State (In-Memory for speed, synced to DB)
+let players = {}; // { socketId: { team, q, r, id } }
+let map = {}; // Key: "q,r", Value: { q, r, owner, clicks, maxClicks }
+const MAP_RADIUS = 6; // Size of map
 
-// --- UTILS ---
-function getDistance(q1, r1, q2, r2) {
-    return (Math.abs(q1 - q2) + Math.abs(q1 + r1 - q2 - r2) + Math.abs(r1 - r2)) / 2;
-}
-
-// Check if a tile is touching the team's territory
-function isConnected(q, r, team) {
-    const neighbors = [
-        [1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]
+// --- HELPER: Hex Logic ---
+function getHexNeighbors(q, r) {
+    const directions = [
+        [1, 0], [1, -1], [0, -1],
+        [-1, 0], [-1, 1], [0, 1]
     ];
-    return neighbors.some(([dq, dr]) => {
-        const neighbor = mapData[`${q + dq},${r + dr}`];
-        return neighbor && neighbor.owner === team;
-    });
+    return directions.map(d => `${q + d[0]},${r + d[1]}`);
 }
 
-// --- GAME LOGIC ---
-io.on('connection', (socket) => {
+function getDistanceToCenter(q, r) {
+    return (Math.abs(q) + Math.abs(q + r) + Math.abs(r)) / 2;
+}
+
+// --- INIT: Load or Create Map ---
+async function initMap() {
+    const { data, error } = await supabase.from('tiles').select('*');
     
-    socket.on('joinGame', () => {
-        const counts = { red: 0, blue: 0 };
-        Object.values(players).forEach(p => counts[p.team]++);
+    // Generate Grid coordinates
+    for (let q = -MAP_RADIUS; q <= MAP_RADIUS; q++) {
+        let r1 = Math.max(-MAP_RADIUS, -q - MAP_RADIUS);
+        let r2 = Math.min(MAP_RADIUS, -q + MAP_RADIUS);
+        for (let r = r1; r <= r2; r++) {
+            const key = `${q},${r}`;
+            // Default stats
+            map[key] = { q, r, owner: 'grey', current_clicks: 0 };
+        }
+    }
+
+    // Apply DB state
+    if (data && data.length > 0) {
+        data.forEach(tile => {
+            const key = `${tile.q},${tile.r}`;
+            if (map[key]) {
+                map[key].owner = tile.owner;
+                map[key].current_clicks = tile.current_clicks;
+            }
+        });
+    } else {
+        // First run: Set starting zones
+        map[`-${MAP_RADIUS},0`].owner = 'red'; // Red Base
+        map[`${MAP_RADIUS},0`].owner = 'blue'; // Blue Base
+        
+        // Sync Initial State to DB
+        const rows = Object.values(map).map(t => ({ q: t.q, r: t.r, owner: t.owner }));
+        await supabase.from('tiles').upsert(rows, { onConflict: ['q', 'r'] });
+    }
+    console.log("Map Initialized");
+}
+
+initMap();
+
+// --- SOCKET LOGIC ---
+io.on('connection', (socket) => {
+    console.log('Player connected:', socket.id);
+
+    // Send current map state immediately
+    socket.emit('map_update', map);
+
+    socket.on('join_game', () => {
+        // Count teams
+        const allPlayers = Object.values(players);
+        const redCount = allPlayers.filter(p => p.team === 'red').length;
+        const blueCount = allPlayers.filter(p => p.team === 'blue').length;
+
+        let team = '';
         
         // Team Assignment Logic
-        let team;
-        if (counts.red === counts.blue) {
-            team = Math.random() > 0.5 ? 'red' : 'blue';
+        if ((redCount + blueCount) % 2 === 0) {
+            // Even: User choice handled on client, but for now we auto-balance or let client request.
+            // Simplified: Auto-assign if even to allow immediate play, or wait for client selection.
+            // Requirement: "if even... they choose". 
+            // We'll tell client to show chooser.
+            socket.emit('request_team_choice');
+            return; 
         } else {
-            team = counts.red < counts.blue ? 'red' : 'blue';
-        }
-
-        players[socket.id] = {
-            id: socket.id,
-            team: team,
-            q: team === 'red' ? -5 : 5,
-            r: 0
-        };
-
-        socket.emit('init', { id: socket.id, team, players, mapData });
-        io.emit('playerJoined', players[socket.id]);
-    });
-
-    socket.on('move', ({ q, r }) => {
-        const p = players[socket.id];
-        if (!p) return;
-
-        // Rule: Can only move to tiles touching your color
-        // Exception: Starting tiles or if you already own it
-        const tile = mapData[`${q},${r}`];
-        const canMove = (tile && tile.owner === p.team) || isConnected(q, r, p.team);
-
-        if (getDistance(p.q, p.r, q, r) === 1 && canMove) {
-            p.q = q;
-            p.r = r;
-            io.emit('playerMoved', { id: socket.id, q, r });
+            // Odd: Assign to smaller team
+            team = redCount < blueCount ? 'red' : 'blue';
+            spawnPlayer(socket, team);
         }
     });
 
-    socket.on('capture', async () => {
-        const p = players[socket.id];
-        if (!p) return;
+    socket.on('choose_team', (choice) => {
+        spawnPlayer(socket, choice);
+    });
 
-        const key = `${p.q},${p.r}`;
-        const tile = mapData[key];
+    socket.on('move', (targetHex) => {
+        const player = players[socket.id];
+        if (!player) return;
 
-        if (tile && tile.owner !== p.team) {
-            // Distance difficulty: Further from center (0,0) = easier
-            const dist = getDistance(0, 0, p.q, p.r);
-            const teamSize = Object.values(players).filter(pl => pl.team === p.team).length;
+        const targetKey = `${targetHex.q},${targetHex.r}`;
+        const targetTile = map[targetKey];
+        
+        if (!targetTile) return;
+
+        // Validation 1: Adjacency
+        const neighbors = getHexNeighbors(player.q, player.r);
+        if (!neighbors.includes(targetKey)) return; // Not neighbor (cheat check)
+
+        // Validation 2: "Touching their color"
+        // The rule: "only go onto tiles that are touching their color tiles"
+        // AND "if grey/enemy... as long as that tile is touching one of that teams tiles"
+        // Simplified: The TARGET tile must have at least one neighbor that is owned by the player's team.
+        const targetNeighbors = getHexNeighbors(targetHex.q, targetHex.r);
+        const hasFriendlyNeighbor = targetNeighbors.some(nKey => map[nKey] && map[nKey].owner === player.team);
+        
+        // Special Case: If moving inside own territory, always allowed?
+        // The prompt says "only go onto tiles that are touching their color tiles". 
+        // If the tile is OWNED by them, it touches itself? Let's assume yes.
+        const isOwned = targetTile.owner === player.team;
+
+        if (hasFriendlyNeighbor || isOwned) {
+            player.q = targetHex.q;
+            player.r = targetHex.r;
+            io.emit('player_update', players);
+        }
+    });
+
+    socket.on('capture_attempt', async () => {
+        const player = players[socket.id];
+        if (!player) return;
+        
+        const key = `${player.q},${player.r}`;
+        const tile = map[key];
+
+        if (tile.owner === player.team) return; // Already owned
+
+        // Calc Difficulty
+        const dist = getDistanceToCenter(tile.q, tile.r);
+        const teamCount = Object.values(players).filter(p => p.team === player.team).length || 1;
+        
+        // Logic: Closer to center = Harder. More players = Easier? Or More players = Harder to balance?
+        // Let's do: Base 5 clicks + (5 - distance). Center is hardest (5+5=10). Edge is easiest.
+        // Divide by team count to make zerg rushing effective.
+        let required = Math.max(1, Math.floor((15 - dist) + (teamCount * 0.5)));
+
+        tile.current_clicks += 1;
+
+        if (tile.current_clicks >= required) {
+            // Captured!
+            tile.owner = player.team;
+            tile.current_clicks = 0;
             
-            // Formula: Base 10 clicks, reduced by team size, increased by proximity to center
-            const required = Math.max(2, (15 - dist) - teamSize);
+            // Persist to DB
+            supabase.from('tiles').upsert({ 
+                q: tile.q, r: tile.r, owner: tile.owner 
+            }, { onConflict: ['q', 'r'] }).then(() => {
+                // Background save, don't await
+            });
             
-            tile.clicks = (tile.clicks || 0) + 1;
-
-            if (tile.clicks >= required) {
-                tile.owner = p.team;
-                tile.clicks = 0;
-                // Save to Supabase
-                await supabase.from('tiles').update({ owner: p.team }).match({ q: p.q, r: p.r });
-                io.emit('tileCaptured', { q: p.q, r: p.r, owner: p.team });
-            }
+            io.emit('map_update', map); // Broadcast full map change
+        } else {
+            // Send partial update (health bar)
+            io.emit('tile_progress', { key, clicks: tile.current_clicks, required });
         }
     });
 
     socket.on('disconnect', () => {
         delete players[socket.id];
-        io.emit('playerLeft', socket.id);
+        io.emit('player_update', players);
+        console.log('Player disconnected');
     });
 });
 
+function spawnPlayer(socket, team) {
+    // Find a valid spawn point (a tile owned by their team)
+    // Default to base if nothing else
+    let startQ = team === 'red' ? -MAP_RADIUS : MAP_RADIUS;
+    let startR = 0;
+
+    // Optional: Spawn on a random tile owned by team?
+    // Let's stick to base for simplicity to ensure they don't get stuck.
+    
+    players[socket.id] = {
+        id: socket.id,
+        team: team,
+        q: startQ,
+        r: startR
+    };
+
+    socket.emit('team_assigned', team);
+    io.emit('player_update', players);
+}
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server active on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
