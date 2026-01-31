@@ -9,192 +9,180 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 
 // --- CONFIG ---
-const MAP_RADIUS = 12; // Big map
+const MAP_RADIUS = 12;
 const MIN_PLAYERS_TO_START = 2;
 
-// --- SUPABASE SETUP ---
-// Ensure these are set in Render Environment Variables
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
+// --- DB SETUP ---
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // --- STATE ---
-let players = {}; 
+let players = {}; // { socketId: { team, q, r, status: 'spectating'|'playing' } }
 let map = {}; 
-let gameState = 'waiting'; // 'waiting' or 'active'
+let readyQueue = new Set(); // Sockets waiting to play
+let gameActive = false;
 
-// --- HEX HELPERS ---
-function getDistanceToCenter(q, r) {
-    return (Math.abs(q) + Math.abs(q + r) + Math.abs(r)) / 2;
-}
-
+// --- HELPERS ---
+function getDistanceToCenter(q, r) { return (Math.abs(q) + Math.abs(q + r) + Math.abs(r)) / 2; }
 function getHexNeighbors(q, r) {
     const directions = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
     return directions.map(d => `${q + d[0]},${r + d[1]}`);
 }
 
-// --- MAP INIT ---
+// --- INIT MAP ---
 async function initMap() {
-    // Try to load from DB
-    const { data, error } = await supabase.from('tiles').select('*');
-    
-    // 1. Generate empty grid
+    const { data } = await supabase.from('tiles').select('*');
     for (let q = -MAP_RADIUS; q <= MAP_RADIUS; q++) {
         let r1 = Math.max(-MAP_RADIUS, -q - MAP_RADIUS);
         let r2 = Math.min(MAP_RADIUS, -q + MAP_RADIUS);
         for (let r = r1; r <= r2; r++) {
-            const key = `${q},${r}`;
-            map[key] = { q, r, owner: 'grey', current_clicks: 0 };
+            map[`${q},${r}`] = { q, r, owner: 'grey', current_clicks: 0 };
         }
     }
+    // Bases
+    map[`-${MAP_RADIUS},0`].owner = 'red';
+    map[`${MAP_RADIUS},0`].owner = 'blue';
 
-    // 2. Overlay DB data
     if (data && data.length > 0) {
-        data.forEach(tile => {
-            const key = `${tile.q},${tile.r}`;
-            if (map[key]) {
-                map[key].owner = tile.owner;
-                map[key].current_clicks = tile.current_clicks;
-            }
+        data.forEach(t => {
+            const k = `${t.q},${t.r}`;
+            if(map[k]) { map[k].owner = t.owner; map[k].current_clicks = t.current_clicks; }
         });
     } else {
-        // First time setup: Bases
-        map[`-${MAP_RADIUS},0`].owner = 'red';
-        map[`${MAP_RADIUS},0`].owner = 'blue';
-        
         const rows = Object.values(map).map(t => ({ q: t.q, r: t.r, owner: t.owner }));
         await supabase.from('tiles').upsert(rows, { onConflict: ['q', 'r'] });
     }
-    console.log(`Map Initialized. Radius: ${MAP_RADIUS}`);
+    console.log("Map Loaded");
 }
-
 initMap();
 
-// --- SOCKET LOGIC ---
+// --- GAME LOGIC ---
 io.on('connection', (socket) => {
-    console.log('Player connected:', socket.id);
-
-    // Send initial state
+    console.log('Connected:', socket.id);
+    
+    // Initial Spectator State
+    players[socket.id] = { id: socket.id, team: 'spectator', q: 0, r: 0, status: 'spectating' };
+    
+    // Broadcast Updates
+    io.emit('player_count', io.engine.clientsCount);
     socket.emit('map_update', map);
-    socket.emit('game_state', gameState);
-    io.emit('player_count', Object.keys(io.sockets.sockets).length); // Update everyone on count
 
-    socket.on('join_game', () => {
-        const playerCount = io.engine.clientsCount;
+    socket.on('request_join', () => {
+        // Player wants to play
+        readyQueue.add(socket.id);
 
-        if (playerCount < MIN_PLAYERS_TO_START) {
-            socket.emit('notification', `Waiting for opponents... (${playerCount}/${MIN_PLAYERS_TO_START})`);
-            return; // Reject join
+        if (readyQueue.size < MIN_PLAYERS_TO_START) {
+            socket.emit('notification', `Waiting for opponent... (1/${MIN_PLAYERS_TO_START})`);
+            return;
         }
 
-        // Enable Game if enough players
-        if (gameState === 'waiting') {
-            gameState = 'active';
-            io.emit('game_state', 'active');
-        }
-
-        // Logic to assign team or let them choose
-        const allPlayers = Object.values(players);
-        const redCount = allPlayers.filter(p => p.team === 'red').length;
-        const blueCount = allPlayers.filter(p => p.team === 'blue').length;
-
-        // "If even... they choose. If odd... assigned to least."
-        if ((redCount + blueCount) % 2 !== 0) {
-            const forcedTeam = redCount < blueCount ? 'red' : 'blue';
-            spawnPlayer(socket, forcedTeam);
-        } else {
-            socket.emit('request_team_choice');
-        }
+        // We have enough players, START THE MATCH
+        startGameSequence();
     });
 
     socket.on('choose_team', (choice) => {
-        // Security check: only allow if game is active
-        if (gameState !== 'active') return;
-        spawnPlayer(socket, choice);
+        // Only valid if we asked them to choose (simplified here to auto-assign for speed or robust checks)
+        // For this logic, we assign teams in startGameSequence to ensure balance
     });
 
     socket.on('move', (targetHex) => {
-        const player = players[socket.id];
-        if (!player) return;
+        const p = players[socket.id];
+        if (!p || p.status !== 'playing') return; // Cannot move if not playing
+        if (!gameActive) return; // Cannot move if game frozen
 
-        const targetKey = `${targetHex.q},${targetHex.r}`;
-        const targetTile = map[targetKey];
-        if (!targetTile) return;
+        const key = `${targetHex.q},${targetHex.r}`;
+        const target = map[key];
+        if (!target) return;
 
-        // Validation: Must be neighbor
-        const neighbors = getHexNeighbors(player.q, player.r);
-        if (!neighbors.includes(targetKey)) return;
+        // Neighbor check
+        const neighbors = getHexNeighbors(p.q, p.r);
+        if (!neighbors.includes(key)) return;
 
-        // Validation: Target tile must have a friendly neighbor OR be owned by us
-        const targetNeighbors = getHexNeighbors(targetHex.q, targetHex.r);
-        const hasFriendlyNeighbor = targetNeighbors.some(nKey => map[nKey] && map[nKey].owner === player.team);
-        const isOwned = targetTile.owner === player.team;
+        // Friendly neighbor check
+        const tNeighbors = getHexNeighbors(targetHex.q, targetHex.r);
+        const hasFriendly = tNeighbors.some(n => map[n] && map[n].owner === p.team);
+        const isOwned = target.owner === p.team;
 
-        if (hasFriendlyNeighbor || isOwned) {
-            player.q = targetHex.q;
-            player.r = targetHex.r;
+        if (hasFriendly || isOwned) {
+            p.q = targetHex.q;
+            p.r = targetHex.r;
             io.emit('player_update', players);
         }
     });
 
-    socket.on('capture_click', async () => {
-        const player = players[socket.id];
-        if (!player) return;
+    socket.on('capture_click', () => {
+        const p = players[socket.id];
+        if (!p || p.status !== 'playing' || !gameActive) return;
 
-        const key = `${player.q},${player.r}`;
-        const tile = map[key];
+        const tile = map[`${p.q},${p.r}`];
+        if (tile.owner === p.team) return;
 
-        if (tile.owner === player.team) return;
-
-        // --- NEW DIFFICULTY LOGIC ---
         const dist = getDistanceToCenter(tile.q, tile.r);
+        let req = Math.max(5, Math.floor(25 - (dist * 1.5)));
+        if (tile.owner !== 'grey') req = Math.floor(req * 1.7);
+
+        tile.current_clicks++;
         
-        // Base difficulty based on map size. 
-        // Edge (dist 12) = Easy (5 clicks). Center (dist 0) = Hard (25 clicks).
-        let baseClicks = Math.floor(25 - (dist * 1.5)); 
-        if (baseClicks < 5) baseClicks = 5;
-
-        // Enemy Multiplier (1.7x)
-        if (tile.owner !== 'grey') {
-            baseClicks = Math.floor(baseClicks * 1.7);
-        }
-
-        tile.current_clicks += 1;
-
-        if (tile.current_clicks >= baseClicks) {
-            // Captured!
-            tile.owner = player.team;
+        if (tile.current_clicks >= req) {
+            tile.owner = p.team;
             tile.current_clicks = 0;
-            
-            // DB Save (Background)
-            supabase.from('tiles').upsert({ 
-                q: tile.q, r: tile.r, owner: tile.owner 
-            }, { onConflict: ['q', 'r'] }).then();
-
+            supabase.from('tiles').upsert({ q: tile.q, r: tile.r, owner: tile.owner }, { onConflict: ['q','r'] }).then();
             io.emit('map_update', map);
         } else {
-            // Send progress update
-            io.emit('tile_progress', { key, clicks: tile.current_clicks, required: baseClicks });
+            io.emit('tile_progress', { key: `${tile.q},${tile.r}`, clicks: tile.current_clicks, required: req });
         }
     });
 
     socket.on('disconnect', () => {
         delete players[socket.id];
+        readyQueue.delete(socket.id);
         io.emit('player_update', players);
         io.emit('player_count', io.engine.clientsCount);
     });
 });
 
-function spawnPlayer(socket, team) {
-    let startQ = team === 'red' ? -MAP_RADIUS : MAP_RADIUS;
-    players[socket.id] = { id: socket.id, team: team, q: startQ, r: 0 };
-    socket.emit('team_assigned', team);
+function startGameSequence() {
+    // 1. Assign Teams to Ready Players
+    const readyIds = Array.from(readyQueue);
+    // Simple alternating assignment
+    readyIds.forEach((id, index) => {
+        const team = index % 2 === 0 ? 'red' : 'blue';
+        const startQ = team === 'red' ? -MAP_RADIUS : MAP_RADIUS;
+        
+        if (players[id]) {
+            players[id].team = team;
+            players[id].q = startQ;
+            players[id].r = 0;
+            players[id].status = 'playing';
+            
+            io.to(id).emit('team_assigned', team);
+        }
+    });
+
+    // 2. Teleport & Update
     io.emit('player_update', players);
+    
+    // 3. Start Countdown
+    gameActive = false; // Freeze input
+    let count = 3;
+    
+    const interval = setInterval(() => {
+        if (count > 0) {
+            io.emit('countdown', count);
+            count--;
+        } else {
+            io.emit('countdown', "GO!");
+            gameActive = true; // Unlock input
+            clearInterval(interval);
+            setTimeout(() => io.emit('countdown', null), 1000); // Clear text
+        }
+    }, 1000);
+    
+    // Clear queue so others can join next batch or handle mid-game joins differently
+    // For now, we keep them in queue? Let's clear to prevent double assignment
+    readyQueue.clear(); 
 }
 
 const PORT = process.env.PORT || 3000;
