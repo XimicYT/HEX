@@ -21,47 +21,54 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // --- STATE ---
 let players = {};
-let map = {};
+let map = {}; // Map now stores separate progress: { red: 0, blue: 0 }
 let scores = { red: 0, blue: 0 };
 let readyQueue = new Set();
 let gameActive = false;
 let scoreInterval = null;
 
-// --- MAP & MATH ---
+// --- MATH ---
 function getDistanceToCenter(q, r) { return (Math.abs(q) + Math.abs(q + r) + Math.abs(r)) / 2; }
-
 function getHexNeighbors(q, r) {
     const directions = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
     return directions.map(d => `${q + d[0]},${r + d[1]}`);
 }
 
+// --- INIT ---
 async function initMap() {
     scores = { red: 0, blue: 0 };
     map = {};
-    players = {};
+    players = {}; 
     readyQueue.clear();
-    gameActive = false; // Reset game state
+    gameActive = false; 
 
-    // Generate Map
+    // Generate Grid
     for (let q = -MAP_RADIUS; q <= MAP_RADIUS; q++) {
         let r1 = Math.max(-MAP_RADIUS, -q - MAP_RADIUS);
         let r2 = Math.min(MAP_RADIUS, -q + MAP_RADIUS);
         for (let r = r1; r <= r2; r++) {
-            map[`${q},${r}`] = { q, r, owner: 'grey', current_clicks: 0 };
+            // New structure: capture_progress per team
+            map[`${q},${r}`] = { q, r, owner: 'grey', capture_progress: { red: 0, blue: 0 } };
         }
     }
     map[`-${MAP_RADIUS},0`].owner = 'red';
     map[`${MAP_RADIUS},0`].owner = 'blue';
 
-    // Sync DB
+    // Load from DB
     const { data } = await supabase.from('tiles').select('*');
     if (data && data.length > 0) {
         data.forEach(t => {
             const k = `${t.q},${t.r}`;
-            if (map[k]) { map[k].owner = t.owner; map[k].current_clicks = t.current_clicks; }
+            if(map[k]) { 
+                map[k].owner = t.owner; 
+                // Ensure legacy DB rows don't break new structure
+                map[k].capture_progress = t.capture_progress || { red: 0, blue: 0 };
+            }
         });
     } else {
-        const rows = Object.values(map).map(t => ({ q: t.q, r: t.r, owner: t.owner }));
+        const rows = Object.values(map).map(t => ({ 
+            q: t.q, r: t.r, owner: t.owner, capture_progress: t.capture_progress 
+        }));
         await supabase.from('tiles').upsert(rows, { onConflict: ['q', 'r'] });
     }
     console.log("Map Initialized");
@@ -98,10 +105,9 @@ async function endGame(winner) {
     gameActive = false;
     clearInterval(scoreInterval);
     io.emit('game_over', winner);
-
-    // Wipe DB
+    
     await supabase.from('tiles').delete().neq('id', 0);
-
+    
     setTimeout(async () => {
         await initMap();
         io.emit('reset_game');
@@ -111,23 +117,25 @@ async function endGame(winner) {
 // --- SOCKETS ---
 io.on('connection', (socket) => {
     players[socket.id] = { id: socket.id, team: 'spectator', q: 0, r: 0, status: 'spectating' };
-
-    io.emit('player_count', io.engine.clientsCount);
+    
+    // FIX 1: Send accurate count based on object keys, not engine count
+    io.emit('player_count', Object.keys(players).length);
+    
     socket.emit('map_update', map);
     socket.emit('score_update', scores);
-
-    // If joining mid-game, send active status so client knows
-    if (gameActive) socket.emit('game_active_sync', true);
+    
+    // Explicitly tell new connection if game is running
+    socket.emit('game_active_sync', gameActive);
 
     socket.on('request_join', () => {
         readyQueue.add(socket.id);
 
         if (gameActive) {
-            // 3RD PLAYER LOGIC: If game is active, JOIN IMMEDIATELY
             assignTeam(socket.id);
+            // Force state update for the joining player
+            socket.emit('game_active_sync', true); 
             socket.emit('notification', "Reinforcements arriving!");
         } else {
-            // Lobby Logic
             if (readyQueue.size < MIN_PLAYERS_TO_START) {
                 socket.emit('notification', `Waiting for pilots... (${readyQueue.size}/${MIN_PLAYERS_TO_START})`);
             } else {
@@ -139,17 +147,17 @@ io.on('connection', (socket) => {
     socket.on('move', (targetHex) => {
         const p = players[socket.id];
         if (!p || p.status !== 'playing' || !gameActive) return;
-
+        
         const key = `${targetHex.q},${targetHex.r}`;
         const target = map[key];
         if (!target) return;
 
         const neighbors = getHexNeighbors(p.q, p.r);
         if (!neighbors.includes(key)) return;
-
+        
         const tNeighbors = getHexNeighbors(targetHex.q, targetHex.r);
         const hasFriendly = tNeighbors.some(n => map[n] && map[n].owner === p.team);
-
+        
         if (hasFriendly || target.owner === p.team) {
             p.q = targetHex.q; p.r = targetHex.r;
             io.emit('player_update', players);
@@ -167,14 +175,23 @@ io.on('connection', (socket) => {
         let req = Math.max(5, Math.floor(25 - (dist * 1.5)));
         if (tile.owner !== 'grey') req = Math.floor(req * 1.7);
 
-        tile.current_clicks++;
-        if (tile.current_clicks >= req) {
+        // FIX 4: Update specific team progress
+        tile.capture_progress[p.team]++;
+
+        if (tile.capture_progress[p.team] >= req) {
+            // Captured!
             tile.owner = p.team;
-            tile.current_clicks = 0;
-            supabase.from('tiles').upsert({ q: tile.q, r: tile.r, owner: tile.owner }, { onConflict: ['q', 'r'] }).then();
+            // Reset both progress bars on capture
+            tile.capture_progress = { red: 0, blue: 0 };
+            
+            supabase.from('tiles').upsert({ 
+                q: tile.q, r: tile.r, owner: tile.owner, capture_progress: tile.capture_progress 
+            }, { onConflict: ['q','r'] }).then();
+            
             io.emit('map_update', map);
         } else {
-            io.emit('tile_progress', { key: `${tile.q},${tile.r}`, clicks: tile.current_clicks, required: req });
+            // Update progress only
+            io.emit('tile_progress', { key: `${tile.q},${tile.r}`, progress: tile.capture_progress, required: req });
         }
     });
 
@@ -182,26 +199,26 @@ io.on('connection', (socket) => {
         delete players[socket.id];
         readyQueue.delete(socket.id);
         io.emit('player_update', players);
-        io.emit('player_count', io.engine.clientsCount);
+        // FIX 1: Recalculate accurate count
+        io.emit('player_count', Object.keys(players).length);
     });
 });
 
 function assignTeam(socketId) {
-    if (!players[socketId]) return;
-
+    if(!players[socketId]) return;
+    
     const all = Object.values(players).filter(p => p.status === 'playing');
     const red = all.filter(p => p.team === 'red').length;
     const blue = all.filter(p => p.team === 'blue').length;
-
-    // Balance teams
+    
     const team = red > blue ? 'blue' : 'red';
     const startQ = team === 'red' ? -MAP_RADIUS : MAP_RADIUS;
-
+    
     players[socketId].team = team;
     players[socketId].q = startQ;
     players[socketId].r = 0;
     players[socketId].status = 'playing';
-
+    
     io.to(socketId).emit('team_assigned', team);
     io.emit('player_update', players);
 }
@@ -211,17 +228,16 @@ function startGameSequence() {
     readyIds.forEach(id => assignTeam(id));
     readyQueue.clear();
 
-    // Game is "Active" during countdown to allow spawning, but clients block input until "GO"
-    gameActive = true;
+    gameActive = true; 
     let count = 3;
-
+    
     const interval = setInterval(() => {
         if (count > 0) {
             io.emit('countdown', count);
             count--;
         } else {
             io.emit('countdown', "GO!");
-            startGameLoop();
+            startGameLoop(); 
             clearInterval(interval);
             setTimeout(() => io.emit('countdown', null), 1000);
         }
